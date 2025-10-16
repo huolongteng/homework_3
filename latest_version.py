@@ -113,25 +113,59 @@ Below contains a function about semi-supeprvised learning.
 
 # Some possible smallest modifications are added.
 # Fixed pseudo-labeling function
-def get_pseudo_labels(dataset, model, threshold=0.65):
-  device = 'cuda' if torch.cuda.is_available() else 'cpu'
-  print("Some samples may be added into training dataset.")
+class PseudoLabelDataset(torch.utils.data.Dataset):
+  """Dataset wrapper that returns pseudo labels for selected indices."""
+
+  def __init__(self, base_dataset, indices, labels):
+    self.base_dataset = base_dataset
+    self.indices = indices
+    self.labels = labels
+
+  def __len__(self):
+    return len(self.indices)
+
+  def __getitem__(self, idx):
+    img, _ = self.base_dataset[self.indices[idx]]
+    return img, self.labels[idx]
+
+
+def get_pseudo_labels(dataset, model, threshold=0.65, used_indices=None):
+  device = "cuda" if torch.cuda.is_available() else "cpu"
+  print("Generating pseudo labels for unlabeled data...")
   data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
   model.eval()
 
   softmax = nn.Softmax(dim=-1)
 
-  for batch in tqdm(data_loader):
-    img, _ = batch
+  selected_indices = []
+  selected_labels = []
+  seen = used_indices if used_indices is not None else set()
+  global_idx = 0
 
+  for imgs, _ in tqdm(data_loader):
     with torch.no_grad():
-      logits = model(img.to(device))
+      logits = model(imgs.to(device))
 
     probs = softmax(logits)
+    max_probs, preds = torch.max(probs, dim=1)
+
+    for i in range(len(imgs)):
+      if global_idx in seen:
+        global_idx += 1
+        continue
+
+      if max_probs[i].item() >= threshold:
+        selected_indices.append(global_idx)
+        selected_labels.append(preds[i].item())
+        seen.add(global_idx)
+
+      global_idx += 1
 
   model.train()
-  return dataset
+
+  print(f"Selected {len(selected_indices)} pseudo-labeled samples with threshold {threshold}.")
+  return PseudoLabelDataset(dataset, selected_indices, selected_labels), seen
 
 # This block is about training parameters setting.
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -149,26 +183,39 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=80, eta_
 n_epochs = 100
 
 # Whether to do semi-supervised learning.
-do_semi = False
+do_semi = True
+semi_update_interval = 10
+semi_threshold = 0.75
+pseudo_datasets = []
+used_unlabeled_indices = set()
 
 # Early stopping parameters
 patience = 10  # How many epochs to wait after last improvement.
 best_acc = 0.0
 epochs_no_improve = 0
-flag_5 = 1
 
 for epoch in range(n_epochs):
-    # ---------- TODO ----------
-    if do_semi and (flag_5 % 5 == 0):
-        # Obtain pseudo-labels for unlabeled data using trained model.
-        pseudo_set = get_pseudo_labels(unlabeled_set, model)
+    # ---------- Semi-supervised update ----------
+    if do_semi and (epoch + 1) % semi_update_interval == 0 and len(used_unlabeled_indices) < len(unlabeled_set):
+        pseudo_set, used_unlabeled_indices = get_pseudo_labels(
+            unlabeled_set, model, threshold=semi_threshold, used_indices=used_unlabeled_indices
+        )
 
-
-        print(f"Add {len(pseudo_set)} new sample.")
-        # Construct a new dataset and a data loader for training.
-        # This is used in semi-supervised learning only.
-        concat_dataset = ConcatDataset([train_set, pseudo_set])
-        train_loader = DataLoader(concat_dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
+        if len(pseudo_set) > 0:
+            print(f"Adding {len(pseudo_set)} pseudo-labeled samples to the training set.")
+            pseudo_datasets.append(pseudo_set)
+            concat_dataset = ConcatDataset([train_set] + pseudo_datasets)
+            train_loader = DataLoader(
+                concat_dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=0,
+                pin_memory=True,
+            )
+        else:
+            print("No new pseudo-labeled samples were selected in this interval.")
+    elif do_semi and (epoch + 1) % semi_update_interval == 0:
+        print("All unlabeled samples have already been assigned pseudo labels.")
 
     # ---------- Training ----------
     # Make sure the model is in train mode before training.
@@ -195,11 +242,11 @@ for epoch in range(n_epochs):
         acc = (logits.argmax(dim=-1) == labels.to(device)).float().mean()
 
         train_loss.append(loss.item())
-        train_accs.append(acc)
+        train_accs.append(acc.item())
 
     # The average loss and accuracy of the training set is the average of the recorded values.
-    train_loss = sum(train_loss) / len(train_loss)
-    train_acc = sum(train_accs) / len(train_accs)
+    train_loss = sum(train_loss) / max(len(train_loss), 1)
+    train_acc = sum(train_accs) / max(len(train_accs), 1)
 
     # Print the information.
     print(f"[ Train | {epoch + 1:03d}/{n_epochs:03d} ] loss = {train_loss:.5f}, acc = {train_acc:.5f}")
@@ -225,7 +272,7 @@ for epoch in range(n_epochs):
         acc = (logits.argmax(dim=-1) == labels.to(device)).float().mean()
 
         valid_loss.append(loss.item())
-        valid_accs.append(acc)
+        valid_accs.append(acc.item())
 
     valid_loss = sum(valid_loss) / len(valid_loss)
     valid_acc = sum(valid_accs) / len(valid_accs)
@@ -235,9 +282,6 @@ for epoch in range(n_epochs):
 
     # Step the learning rate scheduler
     scheduler.step()
-
-    # Flag self-add.
-    flag_5 += 1
 
     # ---------- Early Stopping ----------
     if valid_acc > best_acc:
